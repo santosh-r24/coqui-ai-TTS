@@ -89,6 +89,7 @@ dependencies = [
     "encodec>=0.1.1",
     # XTTS
     "num2words>=0.5.14",
+    "logzero>=1.7.0"
 ]
 
 [project.optional-dependencies]

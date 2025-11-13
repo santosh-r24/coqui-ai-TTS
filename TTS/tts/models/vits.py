@@ -1,4 +1,4 @@
-import logging
+from logzero import logger
 import math
 import os
 from dataclasses import dataclass, field, replace
@@ -39,7 +39,7 @@ from TTS.utils.samplers import BucketBatchSampler
 from TTS.vocoder.models.hifigan_generator import HifiganGenerator
 from TTS.vocoder.utils.generic_utils import plot_results
 
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__)
 
 ##############################
 # IO / Feature extraction
@@ -943,9 +943,11 @@ class Vits(BaseTTS):
             - m_p: :math:`[B, C, T_dec]`
             - logs_p: :math:`[B, C, T_dec]`
         """
-        sid, g, lid, durations = self._set_cond_input(aux_input)
+        # Helper functions to fetch language id and get text length
+        sid, g, lid, durations = self._set_cond_input(aux_input) 
         x_lengths = self._set_x_lengths(x, aux_input)
-
+        logger.debug(f"The lengths of x: {x_lengths}")
+        # Functions to check if multi speaker/ multi lingual -> Which help model to speak in that style 
         # speaker embedding
         if self.args.use_speaker_embedding and sid is not None:
             g = self.emb_g(sid).unsqueeze(-1)
@@ -955,8 +957,12 @@ class Vits(BaseTTS):
         if self.args.use_language_embedding and lid is not None:
             lang_emb = self.emb_l(lid).unsqueeze(-1)
 
+        # Text encoder of VITS, runs Phoneme IDs(phoneme in numbers) through encoder of transformer
+        # Outputs x: Final text embeddings, m_p, logs_p: mean and log-variance of prior distribution (this is the content of the speech)
+        # x_mask: Mask to handle padding in batch processing, text padding 
         x, m_p, logs_p, x_mask = self.text_encoder(x, x_lengths, lang_emb=lang_emb)
-
+        logger.debug(f"x: {x} \n logs_p:{logs_p} \n x_mask:{x_mask}")
+        # Predicts duration of each phoneme embedding in x. Output logw is in log-scale for numerical stability
         if durations is None:
             if self.args.use_sdp:
                 logw = self.duration_predictor(
@@ -971,27 +977,50 @@ class Vits(BaseTTS):
                 logw = self.duration_predictor(
                     x, x_mask, g=g if self.args.condition_dp_on_speaker else None, lang_emb=lang_emb
                 )
+            # length_scale allows to control speech speed, converts logw back to linear scale w(duration) 
             w = torch.exp(logw) * x_mask * self.length_scale
         else:
             assert durations.shape[-1] == x.shape[-1]
             w = durations.unsqueeze(0)
 
+        # Rounds durations to the nearest integer, audio frames can't be fractions - What does this mean ? 
+        #  spectrogram is in frequency(y-axis) and time in discrete domain(x-axis), hence it can't be fractions
+        # w_ceil are [5, 10, 3], check later how this becomes 
         w_ceil = torch.ceil(w)
+        logger.debug(f"log_w:{logw}\n w:{w} \n w_ceil:{w_ceil}")
+        # Calculates total length of output spectogram, by summing all predicted phoneme durations
+        # final length in samples phoneme_1=5 frames + phoneme_2=10 frames
         y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
+        # Creates mask for this new output length, y_mask is audio padding 
         y_mask = sequence_mask(y_lengths, None).to(x_mask.dtype).unsqueeze(1)  # [B, 1, T_dec]
+        logger.debug(f"y_mask:{y_mask}\n y_lengths:{y_lengths} \n w_ceil:{w_ceil}")
+
 
         attn_mask = x_mask * y_mask.transpose(1, 2)  # [B, 1, T_enc] * [B, T_dec, 1]
+        # this function takes integer durations and builds alignment matrix attn - why is this important
+        # This maps which phoneme is active at which audio frame - RAW data for timestamps ? 
+        # cum_duration = torch.cumsum(duration, dim=1) makes w_ceil [5,15,18]
         attn = generate_path(w_ceil.squeeze(1), attn_mask.squeeze(1).transpose(1, 2))
+        logger.debug(f"attn:{attn}\n attn_mask:{attn_mask}")
 
+        #Uses alignment matrix to stretch text features [(m_p, logs_p)] to match length of audio. 
         m_p = torch.matmul(attn.transpose(1, 2), m_p.transpose(1, 2)).transpose(1, 2)
         logs_p = torch.matmul(attn.transpose(1, 2), logs_p.transpose(1, 2)).transpose(1, 2)
 
+        # Sample latent vector z_p from stretched prior distribution: Adds stochastic variation to output for variation
+        #  This is the reparameterization trick.
         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * self.inference_noise_scale
+        # logger.debug(f"z_p:{z_p}\n m_p:{m_p} \n logs_p:{logs_p}")
+        # Normalizing flow, runs z_p frome simple prior distribution BACKWARDS through normalizing flow 
+        # to transform into complex latent representation
         z = self.flow(z_p, y_mask, g=g, reverse=True)
+        logger.debug(f"z:{z} \n z_p:{z_p}\n m_p:{m_p} \n logs_p:{logs_p}")
 
         # upsampling if needed
+        #Hifi GAN requires spectogram to be at different framerate
         z, _, _, y_mask = self.upsampling_z(z, y_lengths=y_lengths, y_mask=y_mask)
-
+        logger.debug(f"Upsampled z:{z}\n y_mask_upsampled:{y_mask}")
+        # decodes to waveform, synthesizes raw audio from z(latent rep)
         o = self.waveform_decoder((z * y_mask)[:, :, : self.max_inference_len], g=g)
 
         outputs = {
