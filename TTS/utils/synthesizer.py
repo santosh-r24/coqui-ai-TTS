@@ -1,8 +1,9 @@
-import logging
+# import logging
 import os
 import time
 from pathlib import Path
 from typing import Any
+from logzero import logger
 
 import numpy as np
 import pysbd
@@ -25,7 +26,7 @@ from TTS.vocoder.models import setup_model as setup_vocoder_model
 from TTS.vocoder.models.base_vocoder import BaseVocoder
 from TTS.vocoder.utils.generic_utils import interpolate_vocoder_input
 
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__)
 
 
 class Synthesizer(nn.Module):
@@ -372,7 +373,11 @@ class Synthesizer(nn.Module):
             vocoder_device = "cuda"
 
         if not source_wav:  # not voice conversion
+            timestamp_list = []
+            current_time = 0.0
             for sen in sens:
+                logger.debug(f"\n--- PROCESSING SENTENCE ---")
+                logger.debug(f"TEXT: {sen}\n")
                 outputs = self.tts_model.synthesize(
                     text=sen,
                     speaker=speaker_name,
@@ -382,6 +387,8 @@ class Synthesizer(nn.Module):
                     use_griffin_lim=use_gl,
                     **kwargs,
                 )
+                logger.debug(f"outputs: {outputs}")
+
                 waveform = outputs["wav"]
                 if not use_gl:
                     mel_postnet_spec = outputs["outputs"]["model_outputs"][0].detach().cpu().numpy()
@@ -406,7 +413,17 @@ class Synthesizer(nn.Module):
                     waveform = waveform.cpu()
                 if not use_gl:
                     waveform = waveform.numpy()
+                # Get audio duration
+                wav_duration_sec = len(waveform) / self.tts_config.audio["sample_rate"] #self.tts_model.ap.sample_rate
+                logger.debug(f"WAVEFORM DURATION: {wav_duration_sec:.2f}s")
                 waveform = waveform.squeeze()
+
+                start_time = current_time
+                end_time = current_time + wav_duration_sec
+
+                timestamp_list.append({"text": sen, "start": start_time, "end": end_time})
+
+                current_time = end_time
 
                 # trim silence
                 if "do_trim_silence" in self.tts_config.audio and self.tts_config.audio["do_trim_silence"]:
@@ -414,6 +431,8 @@ class Synthesizer(nn.Module):
 
                 wavs += list(waveform)
                 wavs += [0] * 10000
+                current_time += 10000 / self.tts_config.audio["sample_rate"]
+            logger.debug(f"\n timestamp info: {timestamp_list}")
         else:
             outputs = self.tts_model.voice_conversion(
                 source_wav, speaker_wav, source_speaker=source_speaker_name, speaker=speaker_name, voice_dir=voice_dir
